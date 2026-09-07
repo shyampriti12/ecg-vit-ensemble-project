@@ -1,3 +1,6 @@
+
+
+
 import os
 import torch
 import timm
@@ -15,8 +18,11 @@ from sklearn.metrics import (
     f1_score,
     confusion_matrix,
     classification_report,
-    roc_auc_score
+    roc_auc_score,
+    roc_curve,
+    auc
 )
+from sklearn.preprocessing import label_binarize
 
 from config import (
     TEST_DIR,
@@ -147,6 +153,78 @@ def save_confusion_matrix(y_true, y_pred, class_names, title):
     print("Confusion matrix saved:", save_path)
 
 
+def save_roc_curve(y_true, probabilities, class_names, title):
+    os.makedirs(
+        os.path.join(OUTPUT_DIR, "roc_curves"),
+        exist_ok=True
+    )
+
+    n_classes = len(class_names)
+    y_true_bin = label_binarize(y_true, classes=list(range(n_classes)))
+
+    fpr = {}
+    tpr = {}
+    roc_auc = {}
+
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], probabilities[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+
+    # Macro-average: interpolate all per-class curves onto a common
+    # FPR grid, then average the TPR values (standard sklearn approach)
+    all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
+    mean_tpr = np.zeros_like(all_fpr)
+
+    for i in range(n_classes):
+        mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+
+    mean_tpr /= n_classes
+
+    fpr["macro"] = all_fpr
+    tpr["macro"] = mean_tpr
+    roc_auc["macro"] = auc(fpr["macro"], tpr["macro"])
+
+    plt.figure(figsize=(8, 6))
+
+    colors = plt.cm.tab10(np.linspace(0, 1, n_classes))
+
+    for i, color in zip(range(n_classes), colors):
+        plt.plot(
+            fpr[i], tpr[i],
+            color=color, lw=2,
+            label=f"{class_names[i]} (AUC = {roc_auc[i]:.3f})"
+        )
+
+    plt.plot(
+        fpr["macro"], tpr["macro"],
+        color="black", lw=2, linestyle="--",
+        label=f"Macro-average (AUC = {roc_auc['macro']:.3f})"
+    )
+
+    plt.plot([0, 1], [0, 1], color="gray", lw=1, linestyle=":")
+
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(title)
+    plt.legend(loc="lower right", fontsize=8)
+    plt.tight_layout()
+
+    save_path = os.path.join(
+        OUTPUT_DIR,
+        "roc_curves",
+        f"{title.replace(' ', '_')}.png"
+    )
+
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+    print("ROC curve saved:", save_path)
+
+    return roc_auc["macro"]
+
+
 def evaluate_model(probabilities, labels, class_names, title):
     predictions = np.argmax(probabilities, axis=1)
 
@@ -202,6 +280,13 @@ def evaluate_model(probabilities, labels, class_names, title):
     save_confusion_matrix(
         labels,
         predictions,
+        class_names,
+        title
+    )
+
+    save_roc_curve(
+        labels,
+        probabilities,
         class_names,
         title
     )
