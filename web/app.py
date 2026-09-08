@@ -1,18 +1,27 @@
 import os
 import sys
 import io
+import base64
 import traceback
 
-# config.py lives one directory above /web, so add PROJECT_ROOT to the path
+# config.py and xai_vit_deit.py live one directory above /web, so add
+# PROJECT_ROOT to the path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import numpy as np
 import torch
-import timm
 from PIL import Image
-from torchvision import transforms
 from flask import Flask, request, jsonify, render_template
 
-from config import CHECKPOINT_DIR, IMAGE_SIZE, NUM_CLASSES
+from config import CHECKPOINT_DIR, NUM_CLASSES
+from xai_vit_deit import (
+    get_transform,
+    load_model,
+    compute_gradient_attention_rollout,
+    compute_swin_gradcam,
+    overlay_cam_on_image,
+    normalize_cam,
+)
 
 app = Flask(__name__)
 
@@ -28,6 +37,12 @@ MODEL_LABELS = {
     "vit": "ViT-B/16",
     "deit": "DeiT-Base",
     "swin": "Swin-Tiny",
+}
+
+MODEL_METHODS = {
+    "vit": "Gradient Attention Rollout",
+    "deit": "Gradient Attention Rollout",
+    "swin": "Grad-CAM",
 }
 
 # Models are loaded once at startup and kept warm in memory here.
@@ -53,14 +68,7 @@ def load_all_models():
     device = get_device()
     print("Using device:", device)
 
-    transform = transforms.Compose([
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
+    transform = get_transform()
 
     models = {}
     val_f1_scores = {}
@@ -71,16 +79,7 @@ def load_all_models():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
         print(f"Loading {model_key} checkpoint...")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-
-        model = timm.create_model(
-            checkpoint["model_name"],
-            pretrained=False,
-            num_classes=NUM_CLASSES,
-        )
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.to(device)
-        model.eval()
+        model, checkpoint = load_model(checkpoint_path, device)
 
         models[model_key] = model
         val_f1_scores[model_key] = checkpoint["best_val_f1"]
@@ -90,6 +89,7 @@ def load_all_models():
 
         print(f"{model_key} loaded | val F1 = {val_f1_scores[model_key]:.4f}")
 
+    # Equation 3.1: normalized, validation-F1-weighted ensemble weights
     total_f1 = sum(val_f1_scores.values())
     if total_f1 == 0:
         print("Warning: all validation F1 scores are zero. Using equal weights.")
@@ -113,6 +113,54 @@ def load_all_models():
 
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def encode_image_to_base64(np_image_uint8):
+    buffer = io.BytesIO()
+    Image.fromarray(np_image_uint8).save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+
+# --------------------------------------------------------------------------
+# Explanation generation (Algorithms 3 & 4, Section 3.3.2)
+# --------------------------------------------------------------------------
+
+def generate_model_explanation(model_key, model, image_tensor, image_pil):
+    """
+    Runs Gradient Attention Rollout (ViT/DeiT) or the Grad-CAM adaptation
+    (Swin) for one model and returns its prediction, cam, and heatmap
+    overlay. `image_tensor` must have requires_grad_(True) set, since both
+    methods backpropagate to get their cam.
+    """
+    if model_key == "swin":
+        cam, pred_idx, probs = compute_swin_gradcam(model, image_tensor)
+    else:
+        cam, pred_idx, probs = compute_gradient_attention_rollout(model, image_tensor)
+
+    overlay = overlay_cam_on_image(image_pil, cam, alpha=0.5)
+
+    return {
+        "predicted_class_idx": pred_idx,
+        "probs": probs,
+        "cam": cam,
+        "confidence": round(float(probs[pred_idx]), 4),
+        "heatmap": encode_image_to_base64(overlay),
+    }
+
+
+def generate_consolidated_explanation(model_cams, weights, image_pil):
+    """
+    Combines each model's cam into a single weighted, class-consistent
+    heatmap (Section 3.3.2, final paragraph), using the same validation-F1
+    weights as the classification ensemble.
+    """
+    consolidated_cam = sum(weights[key] * cam for key, cam in model_cams.items())
+    consolidated_cam = normalize_cam(consolidated_cam)
+
+    overlay = overlay_cam_on_image(image_pil, consolidated_cam, alpha=0.5)
+
+    return encode_image_to_base64(overlay)
 
 
 @app.route("/")
@@ -152,38 +200,51 @@ def predict():
         idx_to_class = _state["idx_to_class"]
         weights = _state["weights"]
 
-        image_tensor = transform(image).unsqueeze(0).to(device)
+        model_explanations = {}
+        final_probs = np.zeros(NUM_CLASSES, dtype=np.float32)
 
-        final_probs = torch.zeros((1, NUM_CLASSES)).to(device)
-        individual_predictions = {}
+        for model_key, model in _state["models"].items():
+            # Fresh tensor per model: both XAI methods backpropagate through
+            # it, so each model needs its own graph.
+            image_tensor = transform(image).unsqueeze(0).to(device)
+            image_tensor.requires_grad_(True)
 
-        with torch.no_grad():
-            for model_key, model in _state["models"].items():
-                outputs = model(image_tensor)
-                probs = torch.softmax(outputs, dim=1)
-                final_probs += weights[model_key] * probs
+            explanation = generate_model_explanation(model_key, model, image_tensor, image)
 
-                pred_idx = torch.argmax(probs, dim=1).item()
-                individual_predictions[model_key] = {
-                    "label": MODEL_LABELS[model_key],
-                    "predicted_class": idx_to_class[pred_idx],
-                    "confidence": round(float(probs[0][pred_idx]), 4),
-                }
+            model_explanations[model_key] = explanation
+            final_probs += weights[model_key] * explanation["probs"]
 
-        final_probs_cpu = final_probs.cpu().numpy()[0]
-        final_pred_idx = int(final_probs_cpu.argmax())
+        final_pred_idx = int(final_probs.argmax())
+
+        individual_predictions = {
+            model_key: {
+                "label": MODEL_LABELS[model_key],
+                "method": MODEL_METHODS[model_key],
+                "predicted_class": idx_to_class[explanation["predicted_class_idx"]],
+                "confidence": explanation["confidence"],
+                "heatmap": explanation["heatmap"],
+            }
+            for model_key, explanation in model_explanations.items()
+        }
+
+        consolidated_heatmap = generate_consolidated_explanation(
+            {key: explanation["cam"] for key, explanation in model_explanations.items()},
+            weights,
+            image
+        )
 
         response = {
             "predicted_class": idx_to_class[final_pred_idx],
-            "confidence": round(float(final_probs_cpu[final_pred_idx]), 4),
+            "confidence": round(float(final_probs[final_pred_idx]), 4),
             "class_probabilities": {
                 idx_to_class[i]: round(float(p), 4)
-                for i, p in enumerate(final_probs_cpu)
+                for i, p in enumerate(final_probs)
             },
             "ensemble_weights": {
                 MODEL_LABELS[k]: round(v, 4) for k, v in weights.items()
             },
             "individual_models": individual_predictions,
+            "consolidated_heatmap": consolidated_heatmap,
         }
 
         return jsonify(response), 200

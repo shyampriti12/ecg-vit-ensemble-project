@@ -248,6 +248,41 @@
     margin: 0 0 14px;
   }
 
+  /* --- Consolidated heatmap --- */
+  .consolidated{
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 20px;
+    align-items: center;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 18px;
+    margin-bottom: 28px;
+  }
+
+  @media (max-width: 560px){
+    .consolidated{ grid-template-columns: 1fr; }
+  }
+
+  .consolidated-heatmap{
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+  }
+
+  .consolidated-caption{
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  .consolidated-caption strong{ color: var(--text); }
+
   .bar-row{
     display: grid;
     grid-template-columns: 150px 1fr 56px;
@@ -279,38 +314,89 @@
 
   .bar-pct{ text-align: right; color: var(--text); }
 
-  .model-table{
-    width: 100%;
-    border-collapse: collapse;
-    font-family: var(--mono);
-    font-size: 12.5px;
+  /* --- Model heatmap cards --- */
+  .model-grid{
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
     margin-top: 6px;
   }
 
-  .model-table th{
-    text-align: left;
-    color: var(--text-dim);
-    font-weight: 500;
-    padding: 8px 6px;
-    border-bottom: 1px solid var(--line);
-    text-transform: uppercase;
+  @media (max-width: 640px){
+    .model-grid{ grid-template-columns: 1fr; }
+  }
+
+  .model-card{
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px;
+  }
+
+  .model-card-heatmap{
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    margin-bottom: 10px;
+    background: var(--panel);
+  }
+
+  .model-card-name{
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 13px;
+    margin: 0 0 2px;
+  }
+
+  .model-card-method{
+    font-family: var(--mono);
     font-size: 10.5px;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.04em;
+    color: var(--trace);
+    margin: 0 0 10px;
   }
 
-  .model-table td{
-    padding: 10px 6px;
-    border-bottom: 1px solid var(--line);
+  .model-card.swin .model-card-method{ color: var(--amber); }
+
+  .model-card-class{
+    font-family: var(--mono);
+    font-size: 12.5px;
     color: var(--text);
+    margin: 0 0 8px;
+    overflow-wrap: anywhere;
   }
 
-  .model-table tr:last-child td{ border-bottom: none; }
+  .model-card-bar-track{
+    height: 5px;
+    background: var(--panel);
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    margin-bottom: 6px;
+  }
+
+  .model-card-bar-fill{
+    height: 100%;
+    background: var(--trace);
+    border-radius: 3px;
+    transition: width 0.5s ease;
+  }
+
+  .model-card.swin .model-card-bar-fill{ background: var(--amber); }
+
+  .model-card-confidence{
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
 
   .weights-note{
     font-family: var(--mono);
     font-size: 11.5px;
     color: var(--text-dim);
-    margin-top: 16px;
+    margin-top: 18px;
   }
 
   #error-msg{
@@ -404,16 +490,21 @@
         </svg>
       </div>
 
+      <div class="section-title">Attention explanation (weighted across all three models)</div>
+      <div class="consolidated">
+        <img class="consolidated-heatmap" id="consolidatedHeatmap" alt="Consolidated attention heatmap">
+        <div class="consolidated-caption">
+          Combines each model's Gradient Attention Rollout / Grad-CAM heatmap using the
+          same validation-F1 weights as the classification ensemble, so the explanation
+          shown is weighted consistently with how the prediction itself was formed.
+        </div>
+      </div>
+
       <div class="section-title">Class probabilities</div>
       <div id="probBars"></div>
 
       <div class="section-title" style="margin-top:26px;">Individual model votes</div>
-      <table class="model-table">
-        <thead>
-          <tr><th>Model</th><th>Prediction</th><th>Confidence</th></tr>
-        </thead>
-        <tbody id="modelRows"></tbody>
-      </table>
+      <div class="model-grid" id="modelGrid"></div>
 
       <div class="weights-note" id="weightsNote"></div>
     </div>
@@ -435,6 +526,8 @@
   const results = document.getElementById('results');
   const traceRule = document.getElementById('traceRule');
   const traceRuleResult = document.getElementById('traceRuleResult');
+
+  const MODEL_ORDER = ['vit', 'deit', 'swin'];
 
   let selectedFile = null;
 
@@ -530,6 +623,8 @@
 
     traceRuleResult.className = 'trace-rule' + (isNormal ? '' : ' abnormal');
 
+    document.getElementById('consolidatedHeatmap').src = data.consolidated_heatmap;
+
     const probBars = document.getElementById('probBars');
     probBars.innerHTML = '';
     const sorted = Object.entries(data.class_probabilities).sort((a, b) => b[1] - a[1]);
@@ -546,18 +641,25 @@
       probBars.appendChild(row);
     }
 
-    const modelRows = document.getElementById('modelRows');
-    modelRows.innerHTML = '';
-    for(const key in data.individual_models){
+    const modelGrid = document.getElementById('modelGrid');
+    modelGrid.innerHTML = '';
+    MODEL_ORDER.forEach((key) => {
       const m = data.individual_models[key];
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td>${m.label}</td>
-        <td>${m.predicted_class}</td>
-        <td>${(m.confidence * 100).toFixed(1)}%</td>
+      if(!m) return;
+
+      const pct = (m.confidence * 100).toFixed(1);
+      const card = document.createElement('div');
+      card.className = 'model-card' + (key === 'swin' ? ' swin' : '');
+      card.innerHTML = `
+        <img class="model-card-heatmap" src="${m.heatmap}" alt="${m.method} heatmap for ${m.label}">
+        <p class="model-card-name">${m.label}</p>
+        <p class="model-card-method">${m.method}</p>
+        <p class="model-card-class">${m.predicted_class}</p>
+        <div class="model-card-bar-track"><div class="model-card-bar-fill" style="width:${pct}%"></div></div>
+        <p class="model-card-confidence">${pct}% confidence</p>
       `;
-      modelRows.appendChild(tr);
-    }
+      modelGrid.appendChild(card);
+    });
 
     const weights = Object.entries(data.ensemble_weights)
       .map(([k, v]) => `${k} ${(v * 100).toFixed(0)}%`)
